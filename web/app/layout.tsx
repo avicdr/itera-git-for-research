@@ -1,0 +1,1 @@
+import "./globals.css";import Providers from "./providers";export const metadata={title:"ResearchGit",description:"Versioned research workspaces"};export default function Layout({children}:{children:React.ReactNode}){return <html lang="en"><body><Providers>{children}</Providers></body></html>}

@@ -1,0 +1,3 @@
+"use client";
+import {useEffect,useState} from "react"; import {API} from "@/lib/api";
+export default function Presence({workspaceId}:{workspaceId:string}) { const [people,setPeople]=useState<string[]>([]); useEffect(()=>{const base=API.replace(/^http/,"ws");const ws=new WebSocket(`${base}/api/collaboration/workspace-${workspaceId}`);ws.onopen=()=>ws.send(JSON.stringify({type:"presence.join",name:`Researcher-${Math.random().toString(36).slice(2,6)}`}));ws.onmessage=e=>{try{const msg=JSON.parse(e.data);if(msg.type==="presence")setPeople(msg.people||[])}catch{}};return()=>ws.close()},[workspaceId]);return <span className="muted">Collaborators: {people.length?people.join(", "):"connecting…"}</span> }

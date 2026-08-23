@@ -1,0 +1,1 @@
+"use client";import {create} from "zustand";type State={selected:Record<string,string>;setBranch:(workspaceId:string,branchId:string)=>void};export const useBranchStore=create<State>(set=>({selected:{},setBranch:(workspaceId,branchId)=>set(s=>({selected:{...s.selected,[workspaceId]:branchId}}))}));
