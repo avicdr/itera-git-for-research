@@ -3,7 +3,7 @@
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import Shell from "@/components/workspace/shell";
-import { API } from "@/lib/api";
+import { api, API } from "@/lib/api";
 
 type PdfDocument = import("pdfjs-dist").PDFDocumentProxy;
 
@@ -20,6 +20,7 @@ export default function PdfPage() {
   const [matches, setMatches] = useState<number[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [annotations,setAnnotations]=useState<any[]>([]);
   const fileUrl = `${API}/api/artifacts/${artifactId}/file`;
 
   const goToPage = useCallback((next: number) => {
@@ -68,6 +69,8 @@ export default function PdfPage() {
     return () => { cancelled = true; };
   }, [page, scale, pageCount]);
 
+  useEffect(()=>{api<any[]>(`/api/artifacts/${artifactId}/annotations?page=${page}`).then(setAnnotations).catch(()=>setAnnotations([]))},[artifactId,page]);
+
   async function searchPdf() {
     const pdf = documentRef.current;
     if (!pdf || !query.trim()) { setMatches([]); return; }
@@ -78,10 +81,11 @@ export default function PdfPage() {
     }
     setMatches(found); if (found[0]) goToPage(found[0]);
   }
+  async function annotatePage(){const note=window.prompt("Add a collaborative note for this page:");if(!note?.trim())return;try{await api(`/api/artifacts/${artifactId}/annotations`,{method:"POST",body:JSON.stringify({page_number:page,note,anchor_data:{kind:"page"}})});setAnnotations(await api<any[]>(`/api/artifacts/${artifactId}/annotations?page=${page}`))}catch{setError("Couldn’t save this annotation.")}}
 
   return <Shell workspaceId={workspaceId}>
-    <div className="flex flex-wrap items-center gap-2 mb-4"><div><h1 className="text-2xl font-semibold">PDF source</h1><p className="muted">Page {page}{pageCount ? ` of ${pageCount}` : ""}</p></div><div className="ml-auto flex flex-wrap gap-2 items-center"><button className="btn" disabled={page <= 1} onClick={() => goToPage(page - 1)}>Previous</button><label className="text-sm">Page <input aria-label="Page number" className="w-16 border rounded px-2 py-1" type="number" min="1" max={pageCount || undefined} value={page} onChange={(event) => goToPage(Number(event.target.value))} /></label><button className="btn" disabled={!pageCount || page >= pageCount} onClick={() => goToPage(page + 1)}>Next</button><button className="btn" onClick={() => setScale((value) => Math.max(.6, value - .2))}>−</button><button className="btn" onClick={() => setScale((value) => Math.min(3, value + .2))}>+</button><button className="btn" onClick={() => setScale(1.2)}>Fit width</button><a className="btn" href={fileUrl} download>Download</a></div></div>
+    <div className="flex flex-wrap items-center gap-2 mb-4"><div><h1 className="text-2xl font-semibold">PDF source</h1><p className="muted">Page {page}{pageCount ? ` of ${pageCount}` : ""}</p></div><div className="ml-auto flex flex-wrap gap-2 items-center"><button className="btn" disabled={page <= 1} onClick={() => goToPage(page - 1)}>Previous</button><label className="text-sm">Page <input aria-label="Page number" className="w-16 border rounded px-2 py-1" type="number" min="1" max={pageCount || undefined} value={page} onChange={(event) => goToPage(Number(event.target.value))} /></label><button className="btn" disabled={!pageCount || page >= pageCount} onClick={() => goToPage(page + 1)}>Next</button><button className="btn" onClick={() => setScale((value) => Math.max(.6, value - .2))}>−</button><button className="btn" onClick={() => setScale((value) => Math.min(3, value + .2))}>+</button><button className="btn" onClick={() => setScale(1.2)}>Fit width</button><button className="btn" onClick={annotatePage}>Annotate page</button><a className="btn" href={fileUrl} download>Download</a></div></div>
     <div className="panel p-3 mb-4 flex gap-2"><input className="flex-1 border rounded px-3 py-2" placeholder="Search this PDF" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => event.key === "Enter" && searchPdf()} /><button className="btn" onClick={searchPdf}>Search</button>{matches.length > 0 && <span className="muted self-center">Found on pages {matches.join(", ")}</span>}</div>
-    {loading && <div className="panel p-8 text-center muted">Loading PDF…</div>}{error && <div className="panel p-8 text-center"><p className="text-red-700 mb-3">{error}</p><a className="btn" href={fileUrl} download>Download original PDF</a></div>}{!loading && !error && <div className="panel p-4 overflow-auto bg-slate-100"><canvas ref={canvasRef} className="block mx-auto bg-white shadow" aria-label={`PDF page ${page}`} /></div>}
+    {loading && <div className="panel p-8 text-center muted">Loading PDF…</div>}{error && <div className="panel p-8 text-center"><p className="text-red-700 mb-3">{error}</p><a className="btn" href={fileUrl} download>Download original PDF</a></div>}{!loading && !error && <><div className="panel p-4 overflow-auto bg-slate-100"><canvas ref={canvasRef} className="block mx-auto bg-white shadow" aria-label={`PDF page ${page}`} /></div><aside className="panel p-4 mt-4"><h2 className="font-semibold">Page {page} annotations</h2>{annotations.length?annotations.map(annotation=><div className="border-t mt-3 pt-3" key={annotation.id}><p>{annotation.note||annotation.selected_text}</p><p className="muted text-sm">{annotation.author.name}</p></div>):<p className="muted mt-2">No annotations on this page yet.</p>}</aside></>}
   </Shell>;
 }

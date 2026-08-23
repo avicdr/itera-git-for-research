@@ -44,12 +44,23 @@ class InviteIn(BaseModel): role:str="EDITOR"; expires_in_days:int=7; max_uses:in
 class MemberRoleIn(BaseModel): role:str
 class CommentThreadIn(BaseModel): selected_text:str=Field(min_length=1); anchor:dict=Field(default_factory=dict); artifact_version_id:uuid.UUID|None=None; content:str=Field(min_length=1)
 class CommentIn(BaseModel): content:str=Field(min_length=1)
+class PdfAnnotationIn(BaseModel): page_number:int=Field(ge=1); selected_text:str=""; anchor_data:dict=Field(default_factory=dict); note:str|None=None; artifact_version_id:uuid.UUID|None=None
+class DiscussionIn(BaseModel): scope:str="WORKSPACE"; title:str|None=None; branch_id:uuid.UUID|None=None; artifact_id:uuid.UUID|None=None; content:str=Field(min_length=1); references:dict=Field(default_factory=dict)
+class DiscussionMessageIn(BaseModel): content:str=Field(min_length=1); references:dict=Field(default_factory=dict)
+class ReviewIn(BaseModel): source_branch_id:uuid.UUID; target_branch_id:uuid.UUID; title:str=Field(min_length=1,max_length=300); description:str|None=None
+class ReviewDecisionIn(BaseModel): decision:str; comment:str|None=None
 
 def public_user(u: User): return {"id":str(u.id),"name":u.name,"email":u.email,"avatar_url":u.avatar_url}
 def session_response(payload: dict, token: str):
     response=JSONResponse(payload)
     response.set_cookie(SESSION_COOKIE,token,httponly=True,samesite="lax",secure=settings.session_cookie_secure,max_age=settings.session_days*86400,path="/")
     return response
+async def notify_mentions(session,workspace_id,actor_id,content,entity_type,entity_id):
+    names=re.findall(r"@([\w .'-]+?)(?=[,!.?\n]|$)",content)
+    if not names:return
+    rows=(await session.execute(select(WorkspaceMember,User).join(User,User.id==WorkspaceMember.user_id).where(WorkspaceMember.workspace_id==workspace_id))).all()
+    for _,person in rows:
+        if person.id!=actor_id and any(person.name.lower()==name.strip().lower() for name in names): session.add(Notification(user_id=person.id,workspace_id=workspace_id,type="MENTION",actor_id=actor_id,entity_type=entity_type,entity_id=entity_id,metadata_json={"content":content[:240]}))
 
 @auth_router.post("/register", status_code=201)
 async def register(data:RegisterIn, session:AsyncSession=Depends(get_session)):
@@ -166,6 +177,93 @@ async def resolve_comment(thread_id:uuid.UUID,session:AsyncSession=Depends(get_s
     thread=await session.get(CommentThread,thread_id)
     if not thread: err("COMMENT_THREAD_NOT_FOUND","Comment thread not found.",404)
     u=await user(session);await require_workspace_role(session,thread.workspace_id,u.id,"EDITOR");thread.resolved_at=datetime.utcnow();session.add(ActivityEvent(workspace_id=thread.workspace_id,actor_id=u.id,event_type="comment_resolved",payload={"thread_id":str(thread.id)}));await session.commit();return {"id":str(thread.id),"resolved_at":thread.resolved_at}
+
+@router.get("/artifacts/{artifact_id}/annotations")
+async def list_pdf_annotations(artifact_id:uuid.UUID,page:int|None=None,session:AsyncSession=Depends(get_session)):
+    artifact=await session.get(Artifact,artifact_id)
+    if not artifact or artifact.artifact_type!="PDF":err("INVALID_ARTIFACT","PDF annotation target not found.",404)
+    u=await user(session);await require_workspace_member(session,artifact.workspace_id,u.id); statement=select(PdfAnnotation,User).join(User,User.id==PdfAnnotation.created_by).where(PdfAnnotation.artifact_id==artifact_id)
+    if page: statement=statement.where(PdfAnnotation.page_number==page)
+    rows=(await session.execute(statement.order_by(desc(PdfAnnotation.created_at)))).all();return [{"id":str(annotation.id),"page_number":annotation.page_number,"selected_text":annotation.selected_text,"anchor_data":annotation.anchor_data,"note":annotation.note,"created_at":annotation.created_at,"resolved_at":annotation.resolved_at,"author":public_user(author)} for annotation,author in rows]
+
+@router.post("/artifacts/{artifact_id}/annotations",status_code=201)
+async def create_pdf_annotation(artifact_id:uuid.UUID,data:PdfAnnotationIn,session:AsyncSession=Depends(get_session)):
+    artifact=await session.get(Artifact,artifact_id)
+    if not artifact or artifact.artifact_type!="PDF":err("INVALID_ARTIFACT","PDF annotation target not found.",404)
+    u=await user(session);await require_workspace_member(session,artifact.workspace_id,u.id)
+    version_id=data.artifact_version_id
+    if not version_id: version_id=(await session.execute(select(ArtifactVersion.id).where(ArtifactVersion.artifact_id==artifact.id).order_by(desc(ArtifactVersion.version_number)))).scalar_one()
+    annotation=PdfAnnotation(workspace_id=artifact.workspace_id,artifact_id=artifact.id,artifact_version_id=version_id,page_number=data.page_number,selected_text=data.selected_text,anchor_data=data.anchor_data,note=data.note,created_by=u.id);session.add(annotation);session.add(ActivityEvent(workspace_id=artifact.workspace_id,actor_id=u.id,event_type="pdf_annotation_created",payload={"artifact_id":str(artifact.id),"annotation_id":str(annotation.id),"page":data.page_number}));await session.commit();return {"id":str(annotation.id),"page_number":annotation.page_number,"note":annotation.note}
+
+@router.get("/workspaces/{workspace_id}/discussions")
+async def list_discussions(workspace_id:uuid.UUID,scope:str|None=None,session:AsyncSession=Depends(get_session)):
+    await workspace_or_404(session,workspace_id); statement=select(DiscussionThread).where(DiscussionThread.workspace_id==workspace_id)
+    if scope:statement=statement.where(DiscussionThread.scope==scope.upper())
+    threads=(await session.execute(statement.order_by(desc(DiscussionThread.updated_at)))).scalars().all();return [{"id":str(thread.id),"scope":thread.scope,"title":thread.title,"branch_id":str(thread.branch_id) if thread.branch_id else None,"artifact_id":str(thread.artifact_id) if thread.artifact_id else None,"created_at":thread.created_at} for thread in threads]
+
+@router.post("/workspaces/{workspace_id}/discussions",status_code=201)
+async def create_discussion(workspace_id:uuid.UUID,data:DiscussionIn,session:AsyncSession=Depends(get_session)):
+    u=await user(session);await require_workspace_member(session,workspace_id,u.id);scope=data.scope.upper()
+    if scope not in {"WORKSPACE","BRANCH","ARTIFACT"}:err("INVALID_DISCUSSION_SCOPE","Scope must be WORKSPACE, BRANCH, or ARTIFACT.",422)
+    if scope=="BRANCH" and not data.branch_id:err("BRANCH_REQUIRED","A branch discussion needs a research direction.",422)
+    if scope=="ARTIFACT" and not data.artifact_id:err("ARTIFACT_REQUIRED","An artifact discussion needs a source.",422)
+    thread=DiscussionThread(workspace_id=workspace_id,scope=scope,title=data.title,branch_id=data.branch_id,artifact_id=data.artifact_id,created_by=u.id);session.add(thread);await session.flush();message=DiscussionMessage(thread_id=thread.id,user_id=u.id,content=data.content,references=data.references);session.add(message);await notify_mentions(session,workspace_id,u.id,data.content,"DISCUSSION",thread.id);session.add(ActivityEvent(workspace_id=workspace_id,actor_id=u.id,event_type="discussion_created",payload={"thread_id":str(thread.id)}));await session.commit();return {"id":str(thread.id)}
+
+@router.get("/discussions/{thread_id}")
+async def discussion_detail(thread_id:uuid.UUID,session:AsyncSession=Depends(get_session)):
+    thread=await session.get(DiscussionThread,thread_id)
+    if not thread:err("DISCUSSION_NOT_FOUND","Discussion not found.",404)
+    u=await user(session);await require_workspace_member(session,thread.workspace_id,u.id);rows=(await session.execute(select(DiscussionMessage,User).join(User,User.id==DiscussionMessage.user_id).where(DiscussionMessage.thread_id==thread_id).order_by(DiscussionMessage.created_at))).all();return {"id":str(thread.id),"title":thread.title,"scope":thread.scope,"messages":[{"id":str(message.id),"content":message.content,"references":message.references,"created_at":message.created_at,"author":public_user(author)} for message,author in rows]}
+
+@router.post("/discussions/{thread_id}/messages",status_code=201)
+async def reply_discussion(thread_id:uuid.UUID,data:DiscussionMessageIn,session:AsyncSession=Depends(get_session)):
+    thread=await session.get(DiscussionThread,thread_id)
+    if not thread:err("DISCUSSION_NOT_FOUND","Discussion not found.",404)
+    u=await user(session);await require_workspace_member(session,thread.workspace_id,u.id);message=DiscussionMessage(thread_id=thread.id,user_id=u.id,content=data.content,references=data.references);session.add(message);await session.flush();await notify_mentions(session,thread.workspace_id,u.id,data.content,"DISCUSSION",thread.id);await session.commit();return {"id":str(message.id)}
+
+@router.get("/notifications")
+async def notifications(unread_only:bool=False,session:AsyncSession=Depends(get_session)):
+    u=await user(session);statement=select(Notification,User).outerjoin(User,User.id==Notification.actor_id).where(Notification.user_id==u.id)
+    if unread_only:statement=statement.where(Notification.read_at.is_(None))
+    rows=(await session.execute(statement.order_by(desc(Notification.created_at)).limit(100))).all();return [{"id":str(note.id),"type":note.type,"workspace_id":str(note.workspace_id),"entity_type":note.entity_type,"entity_id":str(note.entity_id) if note.entity_id else None,"read_at":note.read_at,"created_at":note.created_at,"actor":public_user(actor) if actor else None,"metadata":note.metadata_json} for note,actor in rows]
+
+@router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(notification_id:uuid.UUID,session:AsyncSession=Depends(get_session)):
+    u=await user(session);note=await session.get(Notification,notification_id)
+    if not note or note.user_id!=u.id:err("NOTIFICATION_NOT_FOUND","Notification not found.",404)
+    note.read_at=datetime.utcnow();await session.commit();return {"id":str(note.id),"read_at":note.read_at}
+
+@router.get("/workspaces/{workspace_id}/reviews")
+async def list_reviews(workspace_id:uuid.UUID,status:str|None=None,session:AsyncSession=Depends(get_session)):
+    await workspace_or_404(session,workspace_id);statement=select(ResearchReview).where(ResearchReview.workspace_id==workspace_id)
+    if status:statement=statement.where(ResearchReview.status==status.upper())
+    rows=(await session.execute(statement.order_by(desc(ResearchReview.updated_at)))).scalars().all();return [{"id":str(review.id),"title":review.title,"description":review.description,"source_branch_id":str(review.source_branch_id),"target_branch_id":str(review.target_branch_id),"status":review.status,"created_at":review.created_at,"merged_at":review.merged_at} for review in rows]
+
+@router.post("/workspaces/{workspace_id}/reviews",status_code=201)
+async def create_review(workspace_id:uuid.UUID,data:ReviewIn,session:AsyncSession=Depends(get_session)):
+    u=await user(session);await require_workspace_role(session,workspace_id,u.id,"EDITOR");source=await session.get(Branch,data.source_branch_id);target=await session.get(Branch,data.target_branch_id)
+    if not source or not target or source.workspace_id!=workspace_id or target.workspace_id!=workspace_id:err("BRANCH_NOT_FOUND","Both research directions must be in this workspace.",404)
+    if source.id==target.id:err("INVALID_REVIEW","Choose two different research directions.",422)
+    review=ResearchReview(workspace_id=workspace_id,source_branch_id=source.id,target_branch_id=target.id,title=data.title,description=data.description,created_by=u.id);session.add(review);await session.flush();members=(await session.execute(select(WorkspaceMember).where(WorkspaceMember.workspace_id==workspace_id,WorkspaceMember.user_id!=u.id))).scalars().all()
+    for member in members:session.add(Notification(user_id=member.user_id,workspace_id=workspace_id,type="REVIEW_REQUESTED",actor_id=u.id,entity_type="REVIEW",entity_id=review.id,metadata_json={"title":review.title}))
+    session.add(ActivityEvent(workspace_id=workspace_id,actor_id=u.id,event_type="review_created",payload={"review_id":str(review.id)}));await session.commit();return {"id":str(review.id),"status":review.status}
+
+@router.get("/reviews/{review_id}")
+async def review_detail(review_id:uuid.UUID,session:AsyncSession=Depends(get_session)):
+    review=await session.get(ResearchReview,review_id)
+    if not review:err("REVIEW_NOT_FOUND","Research review not found.",404)
+    u=await user(session);await require_workspace_member(session,review.workspace_id,u.id);source=await session.get(Branch,review.source_branch_id);target=await session.get(Branch,review.target_branch_id);decisions=(await session.execute(select(ResearchReviewDecision,User).join(User,User.id==ResearchReviewDecision.reviewer_id).where(ResearchReviewDecision.review_id==review.id))).all();return {"id":str(review.id),"title":review.title,"description":review.description,"status":review.status,"source":{"id":str(source.id),"name":source.name},"target":{"id":str(target.id),"name":target.name},"decisions":[{"decision":decision.decision,"comment":decision.comment,"reviewer":public_user(reviewer)} for decision,reviewer in decisions]}
+
+@router.post("/reviews/{review_id}/decision")
+async def decide_review(review_id:uuid.UUID,data:ReviewDecisionIn,session:AsyncSession=Depends(get_session)):
+    review=await session.get(ResearchReview,review_id)
+    if not review:err("REVIEW_NOT_FOUND","Research review not found.",404)
+    u=await user(session);await require_workspace_member(session,review.workspace_id,u.id);decision=data.decision.upper()
+    if decision not in {"APPROVED","CHANGES_REQUESTED"}:err("INVALID_REVIEW_DECISION","Decision must be APPROVED or CHANGES_REQUESTED.",422)
+    existing=(await session.execute(select(ResearchReviewDecision).where(ResearchReviewDecision.review_id==review.id,ResearchReviewDecision.reviewer_id==u.id))).scalar_one_or_none()
+    if existing:existing.decision=decision;existing.comment=data.comment
+    else:session.add(ResearchReviewDecision(review_id=review.id,reviewer_id=u.id,decision=decision,comment=data.comment))
+    review.status=decision;await session.commit();return {"id":str(review.id),"status":review.status}
 
 @router.post("/workspaces")
 async def create_workspace(data:WorkspaceIn, session:AsyncSession=Depends(get_session)):
@@ -284,6 +382,24 @@ async def resolve(conflict_id:uuid.UUID,data:ResolveIn,session:AsyncSession=Depe
     c.resolved_text=data.target_text if data.resolution=="TARGET" else c.source_text if data.resolution=="SOURCE" else data.text
     if not c.resolved_text:err("INVALID_RESOLUTION","Manual resolution requires text")
     c.resolved_at=datetime.utcnow();await session.commit();return {"id":c.id,"resolved":True}
+
+@router.get("/merges/{merge_id}")
+async def merge_detail(merge_id:uuid.UUID,session:AsyncSession=Depends(get_session)):
+    merge_record=await session.get(Merge,merge_id)
+    if not merge_record:err("MERGE_NOT_FOUND","Merge not found.",404)
+    u=await user(session);await require_workspace_member(session,merge_record.workspace_id,u.id);conflicts=(await session.execute(select(MergeConflict).where(MergeConflict.merge_id==merge_id))).scalars().all();return {"id":str(merge_record.id),"status":merge_record.status,"source_branch_id":str(merge_record.source_branch_id),"target_branch_id":str(merge_record.target_branch_id),"conflicts":[{"id":str(conflict.id),"artifact_id":str(conflict.artifact_id),"base":conflict.base_text,"target":conflict.target_text,"source":conflict.source_text,"resolved_text":conflict.resolved_text,"resolved_at":conflict.resolved_at} for conflict in conflicts]}
+
+@router.post("/merges/{merge_id}/complete")
+async def complete_merge(merge_id:uuid.UUID,session:AsyncSession=Depends(get_session)):
+    merge_record=await session.get(Merge,merge_id)
+    if not merge_record:err("MERGE_NOT_FOUND","Merge not found.",404)
+    u=await user(session);await require_workspace_role(session,merge_record.workspace_id,u.id,"EDITOR")
+    conflicts=(await session.execute(select(MergeConflict).where(MergeConflict.merge_id==merge_id))).scalars().all()
+    if any(not conflict.resolved_at for conflict in conflicts):err("UNRESOLVED_CONFLICTS","Resolve every conflict before completing the merge.",409)
+    target=await session.get(Branch,merge_record.target_branch_id);source=await session.get(Branch,merge_record.source_branch_id);result,_,_=await plan_merge(session,target,source)
+    for conflict in conflicts:
+        artifact=await session.get(Artifact,conflict.artifact_id);last=(await session.execute(select(ArtifactVersion).where(ArtifactVersion.artifact_id==artifact.id).order_by(desc(ArtifactVersion.version_number)))).scalars().first();number=last.version_number+1;rel=Path("workspaces")/str(artifact.workspace_id)/"artifacts"/str(artifact.id)/"versions"/f"v{number}"/artifact.original_filename;path=settings.storage_root/rel;path.parent.mkdir(parents=True,exist_ok=True);path.write_text(conflict.resolved_text);version=ArtifactVersion(artifact_id=artifact.id,version_number=number,storage_path=str(rel),content_hash=hashlib.sha256(conflict.resolved_text.encode()).hexdigest(),canonical_text=conflict.resolved_text,created_by=u.id);session.add(version);await session.flush();await process(session,artifact,version,settings.storage_root);result[artifact.id]=version.id
+    commit_record=await create_commit(session,merge_record.workspace_id,target,u.id,f"Merge {source.name} into {target.name}",result,source.head_commit_id);merge_record.status="COMPLETED";merge_record.merge_commit_id=commit_record.id;session.add(ActivityEvent(workspace_id=merge_record.workspace_id,actor_id=u.id,event_type="merge_completed",payload={"merge_id":str(merge_record.id),"commit_id":str(commit_record.id)}));await session.commit();return {"merge_id":str(merge_record.id),"status":"COMPLETED","commit_id":str(commit_record.id)}
 @router.post("/workspaces/{workspace_id}/chats")
 async def create_chat(workspace_id:uuid.UUID,data:ChatIn,session:AsyncSession=Depends(get_session)):
     await workspace_or_404(session,workspace_id);u=await user(session);await require_workspace_role(session,workspace_id,u.id,"EDITOR");b=await session.get(Branch,data.branch_id) if data.branch_id else (await session.execute(select(Branch).where(Branch.workspace_id==workspace_id,Branch.name=="main"))).scalar_one();c=ResearchChat(workspace_id=workspace_id,title=data.title,created_by=u.id,active_branch_id=b.id);session.add(c);await session.commit();return {"id":c.id,"title":c.title,"branch_id":b.id}

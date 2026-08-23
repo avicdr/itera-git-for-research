@@ -24,6 +24,7 @@ export default function UploadArtifact({ workspaceId }: { workspaceId: string })
       const response = await fetch(`${API}/api/workspaces/${workspaceId}/artifacts`, {
         method: "POST",
         body: form,
+        credentials: "include",
       });
       const body = await response.json().catch(() => null);
       if (!response.ok) throw new Error(body?.detail?.error?.message ?? "Upload failed.");
